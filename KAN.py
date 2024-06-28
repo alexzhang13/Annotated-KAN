@@ -36,7 +36,8 @@ class KAN(nn.Module):
         config: KANConfig,
     ):
         super(KAN, self).__init__()
-        self.layers = []
+        self.layers = torch.nn.ModuleList()
+        self.layer_widths = layer_widths
 
         in_widths = layer_widths[:-1]
         out_widths = layer_widths[1:]
@@ -62,8 +63,25 @@ class KAN(nn.Module):
             x = layer(x)
 
         return x
-    
+
     def initialize_from_KAN(self):
+        pass
+
+    @torch.no_grad
+    def prune(self, x):
+        """
+        Prune (mask) activations in KAN for efficiency based on weight values.
+        """
+        for layer in self.layers:
+            layer.prune(x)
+
+    @torch.no_grad
+    def grid_extension(self, x: torch.Tensor, new_sz: int):
+        """
+        Increase granularity of B-spline by increasing the number of grid points. We
+        ensure the B-spline over the finer grid maintains the shape of the original through
+        least-squares.
+        """
         pass
 
 
