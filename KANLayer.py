@@ -17,7 +17,7 @@ def generate_control_points(
     grid_size: int,
     device: torch.device,
 ):
-    """ 
+    """
     Generate a vector of {grid_size} equally spaced points in the interval [low_bound, up_bound].
     To account for B-splines of order k, using the same spacing, generate an additional
     k points on each side of the interval. See 2.4 in original paper for details.
@@ -54,14 +54,14 @@ class KANActivation(nn.Module):
         self.register_buffer("grid", grid)
 
         # Define the univariate B-spline function
-        self.univarate_fn = compute_bspline_wrapper(
-            self.grid, spline_order, device
-        )
+        self.univarate_fn = compute_bspline_wrapper(self.grid, spline_order, device)
 
         # Spline parameters
         self.coef = torch.nn.Parameter(
             torch.Tensor(out_dim, in_dim, grid_size + spline_order)
         )
+
+        self._initialization()
 
     def _initialization(self):
         """
@@ -74,14 +74,64 @@ class KANActivation(nn.Module):
         Compute and evaluate the learnable activation functions
         applied to a batch of inputs of size in_dim each.
         """
-        # Broadcast [batch_size x in_dim] to [batch_size x out_dim x in_dim]
-        # x = x[:, None, :].expand(-1, self.out_dim, -1)
-
+        # [bsz x in_dim] to [bsz x out_dim x in_dim x (grid_size + spline_order)]
         bases = self.univarate_fn(x)
+
+        # [bsz x out_dim x in_dim x (grid_size + spline_order)]
         postacts = bases * self.coef[None, ...]
+
+        # [bsz x out_dim x in_dim] to [bsz x out_dim]
         spline = torch.sum(postacts, dim=-1)
 
         return spline
+
+
+class WeightedResidualLayer(nn.Module):
+    """
+    Defines the activation function used in the paper,
+    phi(x) = w_b SiLU(x) + w_s B_spline(x)
+    as a layer.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        residual_std: float = 0.1,
+    ):
+        super(WeightedResidualLayer, self).__init__()
+        self.univariate_weight = torch.nn.Parameter(
+            torch.Tensor(out_dim, in_dim)
+        )  # w_s in paper
+
+        # Residual activation functions
+        self.residual_fn = F.silu
+        self.residual_weight = torch.nn.Parameter(
+            torch.Tensor(out_dim, in_dim)
+        )  # w_b in paper
+
+        self._initialization(residual_std)
+
+
+    def _initialization(self, residual_std):
+        """
+        Initialize each parameter according to the original paper.
+        """
+        nn.init.normal_(self.residual_weight, mean=0.0, std=residual_std)
+        nn.init.ones_(self.univariate_weight)
+
+    def forward(self, x: torch.Tensor, post_acts: torch.Tensor):
+        """
+        Given the input to a KAN layer and the activation (e.g. spline(x)),
+        compute a weighted residual.
+        
+        x has shape (bsz, in_dim) and act has shape (bsz, out_dim, in_dim)
+        """
+
+        # Broadcast the input along out_dim of post_acts
+        res = self.residual_weight * self.residual_fn(x[:, None, :])
+        act = self.univariate_weight * post_acts
+        return res + act
 
 
 class KANLayer(nn.Module):
@@ -105,12 +155,6 @@ class KANLayer(nn.Module):
         self.spline_order = spline_order
         self.device = device
 
-        # Residual activation functions
-        self.residual_fn = F.silu
-        self.residual_weight = torch.nn.Parameter(
-            torch.Tensor(out_dim, in_dim)
-        )  # w_b in paper
-
         # Define univariate function (splines in original KAN)
         self.activation_fn = KANActivation(
             in_dim,
@@ -120,23 +164,19 @@ class KANLayer(nn.Module):
             device,
             grid_range,
         )
-        self.univariate_weight = torch.nn.Parameter(
-            torch.Tensor(out_dim, in_dim)
-        )  # w_s in paper
+
+        # Define the residual connection layer used to compute \phi
+        self.residual_layer = WeightedResidualLayer(in_dim, out_dim, residual_std)
 
         # Cache for regularization
         self.inp = torch.empty(0)
         self.activations = torch.empty(0)
         self.l1_activations = torch.empty(0)
 
-        self._initialization(residual_std)
-
-    def _initialization(self, residual_std):
-        """
-        Initialize each parameter according to the original paper.
-        """
-        nn.init.normal_(self.residual_weight, mean=0.0, std=residual_std)
-        nn.init.ones_(self.univariate_weight)
+    def cache(self, inp: torch.Tensor, acts: torch.Tensor):
+        self.inp = inp
+        self.activations = acts
+        self.l1_activations = torch.sum(torch.mean(torch.abs(acts), dim=0))
 
     def forward(self, x: torch.Tensor):
         """
@@ -148,20 +188,16 @@ class KANLayer(nn.Module):
 
         Returns the output of the KAN operation.
         """
-        
+
         spline = self.activation_fn(x)
 
         # Form the batch of matrices phi(x) of shape [batch_size x out_dim x in_dim]
-        phi = (
-            self.residual_weight * self.residual_fn(x[:, None, :])
-            + self.univariate_weight * spline
-        ) 
+        phi = self.residual_layer(x, spline)
 
-        # Cache activations of training
-        if True:  # self.training:
-            self.inp = x
-            self.activations = phi
-            self.l1_activations = torch.sum(torch.mean(torch.abs(phi), dim=0))
+
+        # Cache activations for regularization during training.
+        # Also useful for visualizing. Can remove for inference.
+        self.cache(x, phi) 
 
         # Really inefficient matmul
         out = torch.sum(phi, dim=-1)
