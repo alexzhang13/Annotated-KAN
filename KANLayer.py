@@ -1,5 +1,5 @@
 # Python libraries
-from typing import List
+from typing import List, Self
 
 # Installed libraries
 import torch
@@ -7,25 +7,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # User-defined libraries
-from bspline import compute_bspline_wrapper
+from bspline import compute_bspline
 
 
 def generate_control_points(
     low_bound: float,
     up_bound: float,
+    in_dim: int,
+    out_dim: int,
     spline_order: int,
     grid_size: int,
     device: torch.device,
 ):
     """
-    Generate a vector of {grid_size} equally spaced points in the interval [low_bound, up_bound].
+    Generate a vector of {grid_size} equally spaced points in the interval [low_bound, up_bound] and broadcast (out_dim, in_dim) copies.
     To account for B-splines of order k, using the same spacing, generate an additional
     k points on each side of the interval. See 2.4 in original paper for details.
     """
+
+    # vector of size [grid_size + 2 * spline_order + 1]
     spacing = (up_bound - low_bound) / grid_size
     grid = torch.arange(-spline_order, grid_size + spline_order + 1, device=device)
     grid = grid * spacing + low_bound
 
+    # [out_dim, in_dim, G + 2k + 1]
+    grid = grid[None, None, ...].expand(out_dim, in_dim, -1).contiguous()
     return grid
 
 
@@ -45,16 +51,26 @@ class KANActivation(nn.Module):
         grid_range: List[float],
     ):
         super(KANActivation, self).__init__()
-        # Define control points
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.spline_order = spline_order
+        self.grid_size = grid_size
+        self.device = device
+        self.grid_range = grid_range
+        # Generate (out, in) copies of equally spaced control points on [a, b]
         grid = generate_control_points(
-            grid_range[0], grid_range[1], spline_order, grid_size, device
+            grid_range[0],
+            grid_range[1],
+            in_dim,
+            out_dim,
+            spline_order,
+            grid_size,
+            device,
         )
-        # Generate (out, in) copies of equally spaced points on [a, b]
-        grid = grid[None, None, ...].expand(out_dim, in_dim, -1).contiguous()
         self.register_buffer("grid", grid)
 
         # Define the univariate B-spline function
-        self.univarate_fn = compute_bspline_wrapper(self.grid, spline_order, device)
+        self.univarate_fn = compute_bspline
 
         # Spline parameters
         self.coef = torch.nn.Parameter(
@@ -75,7 +91,7 @@ class KANActivation(nn.Module):
         applied to a batch of inputs of size in_dim each.
         """
         # [bsz x in_dim] to [bsz x out_dim x in_dim x (grid_size + spline_order)]
-        bases = self.univarate_fn(x)
+        bases = self.univarate_fn(x, self.grid, self.spline_order, self.device)
 
         # [bsz x out_dim x in_dim x (grid_size + spline_order)]
         postacts = bases * self.coef[None, ...]
@@ -84,6 +100,48 @@ class KANActivation(nn.Module):
         spline = torch.sum(postacts, dim=-1)
 
         return spline
+
+    def grid_extension(self, x: torch.Tensor, new_grid_size: int):
+        """
+        Increase granularity of B-spline activation by increasing the
+        number of grid points while maintaining the spline shape.
+        """
+
+        # Re-generate grid points with extended size (uniform)
+        new_grid = generate_control_points(
+            self.grid_range[0],
+            self.grid_range[1],
+            self.in_dim,
+            self.out_dim,
+            self.spline_order,
+            new_grid_size,
+            self.device,
+        )
+
+        # bsz x out_dim x in_dim x (old_grid_size + spline_order)
+        old_bases = self.univarate_fn(x, self.grid, self.spline_order, self.device)
+
+        # bsz x out_dim x in_dim x (new_grid_size + spline_order)
+        bases = self.univarate_fn(x, new_grid, self.spline_order, self.device)
+        # out_dim x in_dim x bsz x (new_grid_size + spline_order)
+        bases = bases.permute(1, 2, 0, 3)
+
+        # bsz x out_dim x in_dim
+        postacts = torch.sum(old_bases * self.coef[None, ...], dim=-1)
+        # out_dim x in_dim x bsz
+        postacts = postacts.permute(1, 2, 0)
+
+        # solve for X in AX = B, A is bases and B is postacts
+        new_coefs = torch.linalg.lstsq(
+            bases.to(self.device),
+            postacts.to(self.device),
+            driver="gelsy" if self.device == "cpu" else "gelsd",
+        ).solution
+
+        # Set new parameters
+        self.grid_size = new_grid_size
+        self.grid = new_grid
+        self.coef = torch.nn.Parameter(new_coefs, requires_grad=True)
 
 
 class WeightedResidualLayer(nn.Module):
@@ -112,7 +170,6 @@ class WeightedResidualLayer(nn.Module):
 
         self._initialization(residual_std)
 
-
     def _initialization(self, residual_std):
         """
         Initialize each parameter according to the original paper.
@@ -124,7 +181,7 @@ class WeightedResidualLayer(nn.Module):
         """
         Given the input to a KAN layer and the activation (e.g. spline(x)),
         compute a weighted residual.
-        
+
         x has shape (bsz, in_dim) and act has shape (bsz, out_dim, in_dim)
         """
 
@@ -165,23 +222,25 @@ class KANLayer(nn.Module):
             grid_range,
         )
 
+        self.activation_mask = nn.Parameter(
+            torch.ones((out_dim, in_dim), device=device), requires_grad=False
+        )
+
         # Define the residual connection layer used to compute \phi
         self.residual_layer = WeightedResidualLayer(in_dim, out_dim, residual_std)
 
         # Cache for regularization
         self.inp = torch.empty(0)
         self.activations = torch.empty(0)
-        self.l1_activations = torch.empty(0)
 
     def cache(self, inp: torch.Tensor, acts: torch.Tensor):
         self.inp = inp
         self.activations = acts
-        self.l1_activations = torch.sum(torch.mean(torch.abs(acts), dim=0))
 
     def forward(self, x: torch.Tensor):
         """
-        Forward pass of KAN. x is expected to be of shape (batch_size, input_size) where
-        input_size is the number of input scalars.
+        Forward pass of KAN. x is expected to be of shape (batch_size, input_size)
+        where input_size is the number of input scalars.
 
         Stores the activations needed for computing the L1 regularization and
         entropy regularization terms.
@@ -194,15 +253,25 @@ class KANLayer(nn.Module):
         # Form the batch of matrices phi(x) of shape [batch_size x out_dim x in_dim]
         phi = self.residual_layer(x, spline)
 
+        phi = phi * self.activation_mask[None, ...]
 
         # Cache activations for regularization during training.
         # Also useful for visualizing. Can remove for inference.
-        self.cache(x, phi) 
+        self.cache(x, phi)
 
         # Really inefficient matmul
         out = torch.sum(phi, dim=-1)
 
         return out
+
+    def grid_extension(self, x: torch.Tensor, new_grid_size: int):
+        """
+        Increase granularity of B-spline by increasing the
+        number of grid points while maintaining the spline shape.
+        """
+
+        self.grid_size = new_grid_size
+        self.activation_fn.grid_extension(x, new_grid_size)
 
 
 if __name__ == "__main__":

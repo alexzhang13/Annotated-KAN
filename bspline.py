@@ -1,15 +1,5 @@
 import torch
 
-# In order to keep the functino generic
-def compute_bspline_wrapper (grid: torch.Tensor, k: int, device: torch.device):
-    """
-    Wrapper function around B-splines to ensure abstraction of choice of phi
-    """
-    def func (x: torch.Tensor):
-        return compute_bspline(x, grid, k, device) 
-
-    return func
-
 # Helper functions for computing B splines over a grid
 def compute_bspline(x: torch.Tensor, grid: torch.Tensor, k: int, device: torch.device):
     """

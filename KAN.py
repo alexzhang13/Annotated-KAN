@@ -1,5 +1,5 @@
 # Python libraries
-from typing import List
+from typing import List, Self
 import random
 
 # Installed libraries
@@ -38,6 +38,7 @@ class KAN(nn.Module):
         super(KAN, self).__init__()
         self.layers = torch.nn.ModuleList()
         self.layer_widths = layer_widths
+        self.config = config
 
         in_widths = layer_widths[:-1]
         out_widths = layer_widths[1:]
@@ -64,25 +65,56 @@ class KAN(nn.Module):
 
         return x
 
-    def initialize_from_KAN(self):
-        pass
+    @torch.no_grad
+    def fix_symbolic(self, layer: int, in_index: int, out_index: int, fn):
+        """
+        For layer {layer}, activation {in_index, out_index}, fix the output
+        to the function fn. This is grossly inefficient, but works.
+        """
 
     @torch.no_grad
-    def prune(self, x):
+    def prune(self, x: torch.Tensor, mag_threshold: float = 0.01):
         """
-        Prune (mask) activations in KAN for efficiency based on weight values.
+        Prune (mask) a node in a KAN layer if the normalized activation
+        incoming or outgoing are lower than mag_threshold.
         """
-        for layer in self.layers:
-            layer.prune(x)
+        # Collect activations and cache
+        self.forward(x)
+
+        # Can't prune at last layer
+        for l_idx in range(len(self.layers) - 1):
+            # Average over the batch and take the abs of all edges
+            in_mags = torch.abs(torch.mean(self.layers[l_idx].activations, dim=0))
+
+            # (in_dim, out_dim), average over out_dim
+            in_score = torch.max(in_mags, dim=-1)[0]
+
+            # Average over the batch and take the abs of all edges
+            out_mags = torch.abs(torch.mean(self.layers[l_idx + 1].activations, dim=0))
+
+            # (in_dim, out_dim), average over out_dim
+            out_score = torch.max(out_mags, dim=0)[0]
+
+            # Check for input, output (normalized) activations > mag_threshold
+            active_neurons = (in_score > mag_threshold) * (out_score > mag_threshold)
+            inactive_neurons_indices = (active_neurons == 0).nonzero()
+
+            # Mask all relevant activations
+            self.layers[l_idx + 1].activation_mask[:, inactive_neurons_indices] = 0
+            self.layers[l_idx].activation_mask[inactive_neurons_indices, :] = 0
+
 
     @torch.no_grad
-    def grid_extension(self, x: torch.Tensor, new_sz: int):
+    def grid_extension(self, x: torch.Tensor, new_grid_size: int):
         """
-        Increase granularity of B-spline by increasing the number of grid points. We
-        ensure the B-spline over the finer grid maintains the shape of the original through
-        least-squares.
+        Increase granularity of B-spline by changing the grid size
+        in the B-spline computation to be new_grid_size.
         """
-        pass
+        self.forward(x)
+        for l_idx in range(len(self.layers)):
+            self.layers[l_idx].grid_extension(self.layers[l_idx].inp, new_grid_size)
+        self.config.grid_size = new_grid_size
+
 
 
 if __name__ == "__main__":
@@ -92,10 +124,11 @@ if __name__ == "__main__":
     random.seed(seed)
 
     config = KANConfig()
-    layers = [2, 5, 1]
+    layers = [2, 5, 5, 5, 1]
     model = KAN(layer_widths=layers, config=config)
 
     bsz = 4
     x = torch.ones(bsz, 2) / 0.8
 
-    print(model(x))
+    model.prune(x)
+    # model.grid_extension(x, new_grid_size=25)

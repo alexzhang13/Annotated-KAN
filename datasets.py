@@ -5,11 +5,6 @@ from typing import List
 import numpy as np
 import torch
 
-
-def normalize(data, mean, std):
-    return (data - mean) / std
-
-
 # Helper function derived from https://github.com/KindXiaoming/pykan/blob/master/kan/utils.py
 def create_dataset(
     f,
@@ -17,42 +12,14 @@ def create_dataset(
     ranges=[-1, 1],
     train_num: int =1000,
     test_num: int=1000,
-    normalize_input: bool=False,
-    normalize_label: bool=False,
     device: torch.device = torch.device("cpu"),
     seed: int=0,
 ):
     """
     Create a synthetic dataset as a function of n_var variables
-
-    Args:
-    -----
-        f : function
-            the symbolic formula used to create the synthetic dataset
-        ranges : list or np.array; shape (2,) or (n_var, 2)
-            the range of input variables. Default: [-1,1].
-        train_num : int
-            the number of training samples. Default: 1000.
-        test_num : int
-            the number of test samples. Default: 1000.
-        device : str
-            device. Default: 'cpu'.
-        seed : int
-            random seed. Default: 0.
-
-    Returns:
-    --------
-        dataset : dic
-            Train/test inputs/labels are dataset['train_input'], dataset['train_label'],
-                        dataset['test_input'], dataset['test_label']
-
-    Example
-    -------
-    >>> f = lambda x: torch.exp(torch.sin(torch.pi*x[:,[0]]) + x[:,[1]]**2)
-    >>> dataset = create_dataset(f, n_var=2, train_num=100)
-    >>> dataset['train_input'].shape
-    torch.Size([100, 2])
     """
+    def normalize(data, mean, std):
+        return (data - mean) / std
 
     np.random.seed(seed)
     torch.manual_seed(seed)

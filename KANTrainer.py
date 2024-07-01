@@ -1,4 +1,5 @@
-from typing import Dict
+from typing import Dict, Optional
+import os
 
 # Imported libraries
 import torch
@@ -32,7 +33,9 @@ def l1_regularization(model: KAN):
     reg = torch.tensor(0.0)
     # regularize coefficient to encourage spline to be zero
     for i in range(len(model.layers)):
-        reg += model.layers[i].l1_activations
+        acts = model.layers[i].activations
+        l1_activations = torch.sum(torch.mean(torch.abs(acts), dim=0))
+        reg += l1_activations
 
     return reg
 
@@ -47,9 +50,11 @@ def entropy_regularization(model: KAN):
     eps = 1e-4
     # regularize coefficient to encourage spline to be zero
     for i in range(len(model.layers)):
+        acts = model.layers[i].activations
+        l1_activations = torch.sum(torch.mean(torch.abs(acts), dim=0))
         activations = (
-            torch.mean(torch.abs(model.layers[i].l1_activations), dim=0)
-            / model.layers[i].l1_activations
+            torch.mean(torch.abs(l1_activations), dim=0)
+            / l1_activations
         )
         entropy = -torch.sum(activations * torch.log(activations + eps))
         reg += entropy
@@ -57,6 +62,7 @@ def entropy_regularization(model: KAN):
     return reg
 
 
+# Adapted from https://github.com/KindXiaoming/pykan
 def train(
     model: KAN,
     dataset: Dict[str, torch.Tensor],
@@ -67,9 +73,21 @@ def train(
     steps: int = 10000,
     loss_fn=None,
     log: int = 20,
+    # grid_extension_freq: int = 100000,
+    # grid_extension_factor: int = 5,
     lr: float = 3e-5,
+    save_path: str ='./saved_models/',
+    ckpt_name: Optional[str] = 'best.pt',
 ):
-    pbar = tqdm(range(steps), desc="KAN Training", ncols=100)
+    """
+    Train loop for KANs. Logs loss every {log} steps and uses
+    the best checkpoint as the trained model. Returns a dict of
+    the loss trajectory.
+    """
+    if not os.path.exists(save_path):
+       os.makedirs(save_path) 
+
+    pbar = tqdm(range(steps), desc="KAN Training", ncols=200)
 
     loss_fn = loss_fn_eval = lambda x, y: torch.mean((x - y) ** 2)
 
@@ -77,52 +95,57 @@ def train(
     results = {}
     results["train_loss"] = []
     results["test_loss"] = []
-    results["reg"] = []
+    results["regularization"] = []
     results["best_test_loss"] = []
+
+    train_size = dataset["train_input"].shape[0]
+    test_size = dataset["test_input"].shape[0]
+
     best_test_loss = torch.tensor(1e9)
 
-    for _ in pbar:
-        train_id = np.random.choice(
-            dataset["train_input"].shape[0], batch_size, replace=False
-        )
-        test_id = np.random.choice(
-            dataset["test_input"].shape[0], batch_size_test, replace=False
-        )
+    for step in pbar:
+        train_id = np.random.choice(train_size, batch_size, replace=False)
+        test_id = np.random.choice(test_size, batch_size_test, replace=False)
+        x = dataset["train_input"][train_id].to(device)
+        y = dataset["train_label"][train_id].to(device)
+        x_eval = dataset["test_input"][test_id].to(device)
+        y_eval = dataset["test_input"][test_id].to(device)
 
-        pred = model.forward(dataset["train_input"][train_id].to(device))
-        train_loss = loss_fn(pred, dataset["train_label"][train_id].to(device))
-        reg_ = regularization(model)
-        loss = train_loss + reg_lambda * reg_
+        pred = model.forward(x)
+        train_loss = loss_fn(pred, y)
+        ent_l1_reg = regularization(model)
+        loss = train_loss + reg_lambda * ent_l1_reg
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        test_loss = loss_fn_eval(
-            model.forward(dataset["test_input"][test_id].to(device)),
-            dataset["test_label"][test_id].to(device),
-        )
+        test_loss = loss_fn_eval(model.forward(x_eval), y_eval)
         if best_test_loss > test_loss:
             best_test_loss = test_loss
+            if ckpt_name is not None:
+                print('saving at step', step)
+                torch.save(model.state_dict(), os.path.join(save_path, ckpt_name))
 
-        if _ % log == 0:
+        if step % log == 0:
             pbar.set_description(
                 "train loss: %.2e | test loss: %.2e | reg: %.2e "
                 % (
-                    torch.sqrt(train_loss).cpu().detach().numpy(),
-                    torch.sqrt(test_loss).cpu().detach().numpy(),
-                    reg_.cpu().detach().numpy(),
+                    train_loss.cpu().detach().numpy(),
+                    test_loss.cpu().detach().numpy(),
+                    ent_l1_reg.cpu().detach().numpy(),
                 )
             )
 
-        results["train_loss"].append(torch.sqrt(train_loss).cpu().detach().numpy())
-        results["test_loss"].append(torch.sqrt(test_loss).cpu().detach().numpy())
+        results["train_loss"].append(train_loss.cpu().detach().numpy())
+        results["test_loss"].append(test_loss.cpu().detach().numpy())
         results["best_test_loss"].append(best_test_loss.cpu().detach().numpy())
-        results["reg"].append(reg_.cpu().detach().numpy())
+        results["regularization"].append(ent_l1_reg.cpu().detach().numpy())
 
-        # if save_fig and _ % save_fig_freq == 0:
-        #     self.plot(folder=img_folder, in_vars=in_vars, out_vars=out_vars, title="Step {}".format(_), beta=beta)
-        #     plt.savefig(img_folder + '/' + str(_) + '.jpg', bbox_inches='tight', dpi=200)
-        #     plt.close()
+        # if step % grid_extension_freq == 0:
+        #     model.grid_extension(x, model.config.grid_size + grid_extension_factor)
+
+    if ckpt_name is not None:
+        model.load_state_dict(torch.load(os.path.join(save_path, ckpt_name)))
 
     return results
 
