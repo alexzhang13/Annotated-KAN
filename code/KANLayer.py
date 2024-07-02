@@ -144,7 +144,6 @@ class KANActivation(nn.Module):
         self.coef = torch.nn.Parameter(new_coefs, requires_grad=True)
 
 
-
 class WeightedResidualLayer(nn.Module):
     """
     Defines the activation function used in the paper,
