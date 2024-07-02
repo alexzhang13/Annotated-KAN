@@ -1,5 +1,5 @@
 # Python libraries
-from typing import List, Self
+from typing import List, Self, Callable
 import random
 
 # Installed libraries
@@ -66,11 +66,19 @@ class KAN(nn.Module):
         return x
 
     @torch.no_grad
-    def fix_symbolic(self, layer: int, in_index: int, out_index: int, fn):
+    def set_symbolic(
+        self,
+        layer: int,
+        in_index: int,
+        out_index: int,
+        fix: bool,
+        fn,
+    ):
         """
-        For layer {layer}, activation {in_index, out_index}, fix the output
-        to the function fn. This is grossly inefficient, but works.
+        For layer {layer}, activation {in_index, out_index}, fix (or unfix if {fix=False})
+        the output to the function {fn}. This is grossly inefficient, but works.
         """
+        self.layers[layer].set_symbolic(in_index, out_index, fix, fn)
 
     @torch.no_grad
     def prune(self, x: torch.Tensor, mag_threshold: float = 0.01):
@@ -103,7 +111,6 @@ class KAN(nn.Module):
             self.layers[l_idx + 1].activation_mask[:, inactive_neurons_indices] = 0
             self.layers[l_idx].activation_mask[inactive_neurons_indices, :] = 0
 
-
     @torch.no_grad
     def grid_extension(self, x: torch.Tensor, new_grid_size: int):
         """
@@ -114,7 +121,6 @@ class KAN(nn.Module):
         for l_idx in range(len(self.layers)):
             self.layers[l_idx].grid_extension(self.layers[l_idx].inp, new_grid_size)
         self.config.grid_size = new_grid_size
-
 
 
 if __name__ == "__main__":

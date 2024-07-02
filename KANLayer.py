@@ -1,5 +1,5 @@
 # Python libraries
-from typing import List, Self
+from typing import List, Self, Callable
 
 # Installed libraries
 import torch
@@ -144,6 +144,7 @@ class KANActivation(nn.Module):
         self.coef = torch.nn.Parameter(new_coefs, requires_grad=True)
 
 
+
 class WeightedResidualLayer(nn.Module):
     """
     Defines the activation function used in the paper,
@@ -190,6 +191,46 @@ class WeightedResidualLayer(nn.Module):
         act = self.univariate_weight * post_acts
         return res + act
 
+class KANSymbolic(nn.Module):
+    "Defines and stores the Symbolic functions fixed / set for a KAN."
+
+    def __init__(self, in_dim: int, out_dim: int, device: torch.device):
+        """
+        We have to store a 2D array of univariate functions, one for each
+        edge in the KAN layer. 
+        """
+        super(KANSymbolic, self).__init__()
+        
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        self.fns = [[lambda x: x for _ in range(in_dim)] for _ in range(out_dim)]
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Run symbolic activations over all inputs in x, where
+        x is of shape (batch_size, in_dim). Returns a tensor of shape
+        (batch_size, out_dim, in_dim).
+        """
+        
+        acts = []
+        # Really inefficient, try tensorizing later.
+        for j in range(self.in_dim):
+            act_ins = []
+            for i in range(self.out_dim):
+                o = torch.vmap(self.fns[i][j])(x[:,[j]]).squeeze(dim=-1)
+                act_ins.append(o)
+            acts.append(torch.stack(act_ins, dim=-1))
+        acts = torch.stack(acts, dim=-1)
+
+        return acts
+
+    def set_symbolic(self, in_index: int, out_index: int, fn):
+        """
+        Set symbolic function at specified edge to new function.
+        """
+        self.fns[out_index][in_index] = fn 
+
 
 class KANLayer(nn.Module):
     "Defines a KAN layer from in_dim variables to out_dim variables."
@@ -221,10 +262,17 @@ class KANLayer(nn.Module):
             device,
             grid_range,
         )
+        
+        self.symbolic_fn = KANSymbolic(
+            in_dim,
+            out_dim,
+            device
+        )
 
         self.activation_mask = nn.Parameter(
-            torch.ones((out_dim, in_dim), device=device), requires_grad=False
-        )
+            torch.ones((out_dim, in_dim), device=device)
+        ).requires_grad_(False)
+        self.symbolic_mask = torch.nn.Parameter(torch.zeros(out_dim, in_dim, device=device)).requires_grad_(False)
 
         # Define the residual connection layer used to compute \phi
         self.residual_layer = WeightedResidualLayer(in_dim, out_dim, residual_std)
@@ -236,6 +284,17 @@ class KANLayer(nn.Module):
     def cache(self, inp: torch.Tensor, acts: torch.Tensor):
         self.inp = inp
         self.activations = acts
+
+    def set_symbolic(self, in_index: int, out_index: int, fix:bool, fn):
+        """
+        Set the symbolic mask to be fixed (fix=1) or unfixed. 
+        """
+        if fix:
+            self.symbolic_mask[out_index, in_index] = 1
+            self.symbolic_fn.set_symbolic(in_index, out_index, fn)
+        else:
+            self.symbolic_mask[out_index, in_index] = 0
+
 
     def forward(self, x: torch.Tensor):
         """
@@ -253,6 +312,11 @@ class KANLayer(nn.Module):
         # Form the batch of matrices phi(x) of shape [batch_size x out_dim x in_dim]
         phi = self.residual_layer(x, spline)
 
+        # Perform symbolic computations
+        sym_phi = self.symbolic_fn(x)
+        phi = phi * (self.symbolic_mask == 0) + sym_phi * self.symbolic_mask
+
+        # Mask out pruned edges
         phi = phi * self.activation_mask[None, ...]
 
         # Cache activations for regularization during training.

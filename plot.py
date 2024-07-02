@@ -1,4 +1,5 @@
 # Python libraries
+from typing import Dict, List
 import os
 
 # Imported libraries
@@ -120,7 +121,7 @@ def plot(model: KAN, folder="./figures", scale=0.5, title=None):
     plt.show()
 
 
-def plot_results(results):
+def plot_results(results: Dict[str, List[float]]):
     """
     Function for plotting the interior of a KAN, similar to the original paper.
     """

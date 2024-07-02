@@ -72,6 +72,7 @@ def train(
     reg_lambda: float = 0.1,
     steps: int = 10000,
     loss_fn=None,
+    loss_fn_eval=None,
     log: int = 20,
     # grid_extension_freq: int = 100000,
     # grid_extension_factor: int = 5,
@@ -89,7 +90,10 @@ def train(
 
     pbar = tqdm(range(steps), desc="KAN Training", ncols=200)
 
-    loss_fn = loss_fn_eval = lambda x, y: torch.mean((x - y) ** 2)
+    if loss_fn is None:
+        loss_fn = lambda x, y: torch.mean((x - y) ** 2)
+    if loss_fn_eval is None:
+        loss_fn_eval = lambda x, y: torch.mean((x - y) ** 2)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     results = {}
@@ -109,7 +113,7 @@ def train(
         x = dataset["train_input"][train_id].to(device)
         y = dataset["train_label"][train_id].to(device)
         x_eval = dataset["test_input"][test_id].to(device)
-        y_eval = dataset["test_input"][test_id].to(device)
+        y_eval = dataset["test_label"][test_id].to(device)
 
         pred = model.forward(x)
         train_loss = loss_fn(pred, y)
@@ -123,7 +127,6 @@ def train(
         if best_test_loss > test_loss:
             best_test_loss = test_loss
             if ckpt_name is not None:
-                print('saving at step', step)
                 torch.save(model.state_dict(), os.path.join(save_path, ckpt_name))
 
         if step % log == 0:
